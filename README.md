@@ -2,7 +2,7 @@
 
 > **Phase 1 — Single-Node Queue** | C++20 | CMake | SQLite
 
-A placement-worthy systems project demonstrating Distributed Systems foundations,
+A systems project demonstrating Distributed Systems foundations,
 Concurrency, Storage, and Performance Engineering in modern C++.
 
 ---
