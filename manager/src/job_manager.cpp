@@ -184,6 +184,28 @@ VoidResult JobManager::fail_job(
     return VoidResult::Ok();
 }
 
+// ─── requeue_job ─────────────────────────────────────────────────────────────
+// Called by the server when a worker disconnects mid-execution.
+// Does NOT consume a retry slot — the job gets another full chance.
+
+VoidResult JobManager::requeue_job(const std::string& job_id) {
+    Logger::warn(kComp,
+        "Requeueing job " + job_id + " (worker disconnected — retry count preserved)");
+
+    if (auto r = storage_->update_status(job_id, JobStatus::PENDING); r.err()) {
+        return VoidResult::Err("requeue_job update_status: " + r.error());
+    }
+
+    auto job_result = storage_->get_job(job_id);
+    if (job_result.err())
+        return VoidResult::Err("requeue_job get_job: " + job_result.error());
+    if (!job_result.value().has_value())
+        return VoidResult::Err("requeue_job: job not found: " + job_id);
+
+    queue_.push(std::move(*job_result.value()));
+    return VoidResult::Ok();
+}
+
 // ─── Metrics ─────────────────────────────────────────────────────────────────
 
 JobManager::Metrics JobManager::get_metrics() const {

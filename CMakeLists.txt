@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
   distributed_job_queue
-  VERSION 0.1.0
-  DESCRIPTION "High-Performance Distributed Job Queue — Phase 1"
+  VERSION 0.2.0
+  DESCRIPTION "High-Performance Distributed Job Queue — Phase 2 (TCP Networking)"
   LANGUAGES CXX
 )
 
@@ -40,9 +40,7 @@ FetchContent_Declare(
   GIT_SHALLOW    TRUE
 )
 
-# Prevent GTest from overriding our compiler/linker settings on Windows
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-# Don't install GTest alongside our targets
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
@@ -55,15 +53,23 @@ add_subdirectory(common)
 add_subdirectory(storage)
 add_subdirectory(manager)
 add_subdirectory(worker)
+add_subdirectory(net)
+add_subdirectory(server)
+add_subdirectory(client_lib)
+add_subdirectory(worker_process)
 add_subdirectory(demo)
 add_subdirectory(tests)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 message(STATUS "")
 message(STATUS "══════════════════════════════════════════")
-message(STATUS "  Distributed Job Queue — Phase 1")
+message(STATUS "  Distributed Job Queue — Phase 2")
 message(STATUS "  Build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ std    : C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  SQLite3    : ${SQLite3_VERSION}")
+message(STATUS "  Targets    : job_manager_server")
+message(STATUS "               job_client")
+message(STATUS "               job_worker_process")
+message(STATUS "               phase1_demo")
 message(STATUS "══════════════════════════════════════════")
 message(STATUS "")

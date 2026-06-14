@@ -59,6 +59,11 @@ public:
         int                current_retry_count,
         int                max_retries);
 
+    // Re-enqueue a job whose worker died mid-execution (Phase 2).
+    // Does NOT increment retry_count or jobs_retried_.
+    // Resets status to PENDING in storage and pushes back into the in-memory queue.
+    [[nodiscard]] VoidResult requeue_job(const std::string& job_id);
+
     // ── Metrics ───────────────────────────────────────────────────────────────
 
     struct Metrics {
