@@ -6,12 +6,10 @@
 #include <net/protocol.hpp>
 #include <net/socket_utils.hpp>
 
-
+#include <algorithm>
 #include <chrono>
 #include <thread>
-#include <algorithm>
 #include <unistd.h>
-
 
 using namespace std::chrono_literals;
 static constexpr const char* kComp = "Server";
@@ -44,10 +42,10 @@ void Server::run() {
     loop_.add_fd(listen_fd_, net::Events::READ,
         [this](int fd, uint32_t) { (void)fd; on_new_connection(); });
 
-    // Start reaper thread.
+    // Phase 2 reaper: detects TCP-dead workers by heartbeat fd-timestamp.
     reaper_thread_ = std::thread([this] { reaper_loop(); });
 
-    loop_.run();  // blocks
+    loop_.run();  // blocks until stop()
 
     // Cleanup: broadcast shutdown to all clients/workers.
     auto shutdown_msg = net::make_server_shutdown();
@@ -59,7 +57,6 @@ void Server::run() {
     conns_.clear();
     if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
 
-    // Reaper thread exits because loop_.running() is false → loop_.stop() was called.
     if (reaper_thread_.joinable()) reaper_thread_.join();
 
     Logger::info(kComp, "Shutdown complete");
@@ -74,7 +71,7 @@ void Server::stop() {
 void Server::on_new_connection() {
     while (true) {
         int fd = net::tcp_accept(listen_fd_);
-        if (fd < 0) break;  // EAGAIN — no more pending connections
+        if (fd < 0) break;
 
         Logger::info(kComp, "Accepted connection fd=" + std::to_string(fd));
 
@@ -89,7 +86,7 @@ void Server::on_new_connection() {
                                                 on_readable(fd);
             });
 
-        // Track heartbeat timestamp for this new connection.
+        // Track heartbeat timestamp (Phase 2 fd-keyed path).
         {
             std::lock_guard<std::mutex> lk{hb_mutex_};
             last_seen_ms_[fd] = now_ms();
@@ -114,7 +111,6 @@ void Server::on_readable(int fd) {
         close_conn(fd);
     }
 
-    // Check if reaper flagged any stale fds.
     evict_stale();
 }
 
@@ -126,7 +122,6 @@ void Server::on_writable(int fd) {
 
     bool flushed = it->second.conn->do_write();
     if (flushed) {
-        // Nothing left to write — unwatch WRITE to avoid busy-polling.
         loop_.modify_fd(fd, net::Events::READ);
     }
 }
@@ -146,10 +141,10 @@ void Server::handle_message(int fd, ConnState& state, const net::Message& msg) {
             handle_pull_job(fd, state);
             break;
         case net::MsgType::COMPLETE_JOB:
-            handle_complete_job(fd, msg);
+            handle_complete_job(fd, state, msg);
             break;
         case net::MsgType::FAIL_JOB:
-            handle_fail_job(fd, msg);
+            handle_fail_job(fd, state, msg);
             break;
         case net::MsgType::HEARTBEAT:
             handle_heartbeat(fd, msg);
@@ -172,94 +167,139 @@ void Server::handle_submit_job(int fd, const net::Message& msg) {
     auto result = manager_.submit_job(job_type, payload, priority, max_retries);
     if (result.ok()) {
         send_to(fd, net::make_job_submitted(result.value()));
-        try_dispatch();  // wake any pending worker
+        try_dispatch();
     } else {
         send_to(fd, net::make_job_submitted_err(result.error()));
     }
 }
 
 // ─── handle_register_worker ───────────────────────────────────────────────────
+// Phase 3: register worker in WorkerRegistry (not just in ConnState).
 
 void Server::handle_register_worker(int fd, ConnState& state,
                                     const net::Message& msg) {
     state.role      = ConnRole::WORKER;
     state.worker_id = net::parse_worker_id(msg);
+
+    // Phase 3: register in the WorkerRegistry.
+    // If the worker reconnects after a crash with the same worker_id, the old
+    // entry is replaced (re-registration is idempotent).
+    manager_.worker_registry().register_worker(state.worker_id);
+
     Logger::info(kComp, "Worker registered: " + state.worker_id
                          + " fd=" + std::to_string(fd));
     send_to(fd, net::make_register_ack(true));
 }
 
 // ─── handle_pull_job ─────────────────────────────────────────────────────────
+// Phase 3: grant a lease when a job is dispatched.
 
 void Server::handle_pull_job(int fd, ConnState& state) {
     auto job = manager_.try_pull_job();
     if (job) {
         dispatched_[job->job_id] = fd;
+
+        // Phase 3: record the assignment in WorkerRegistry.
+        if (!state.worker_id.empty())
+            manager_.worker_registry().assign_job(state.worker_id, job->job_id);
+
+        // Phase 3: grant a lease — job must be completed within 30s.
+        if (!state.worker_id.empty())
+            manager_.grant_lease(job->job_id, state.worker_id);
+
         Logger::info(kComp, "Dispatched job " + job->job_id
-                             + " to worker " + state.worker_id);
+                             + " to worker " + state.worker_id
+                             + " [lease=30s]");
         send_to(fd, net::make_job_dispatch(*job));
     } else {
-        // No job — add to pending list; worker will wait.
         pending_pulls_.push_back(fd);
         send_to(fd, net::make_no_job());
     }
 }
 
 // ─── handle_complete_job ──────────────────────────────────────────────────────
+// Phase 3: revoke lease and release from WorkerRegistry.
 
-void Server::handle_complete_job(int fd, const net::Message& msg) {
+void Server::handle_complete_job(int fd, ConnState& state, const net::Message& msg) {
     std::string job_id = net::parse_job_id(msg);
     dispatched_.erase(job_id);
+
+    // Phase 3: revoke lease + release from registry.
+    manager_.revoke_lease(job_id);
+    if (!state.worker_id.empty())
+        manager_.worker_registry().release_job(state.worker_id, job_id);
+
     auto r = manager_.complete_job(job_id);
     send_to(fd, net::make_ack(r.ok(), r.ok() ? "" : r.error()));
-    try_dispatch();  // maybe another pending worker can be served
+    try_dispatch();
 }
 
 // ─── handle_fail_job ─────────────────────────────────────────────────────────
+// Phase 3: revoke lease and release from WorkerRegistry.
 
-void Server::handle_fail_job(int fd, const net::Message& msg) {
+void Server::handle_fail_job(int fd, ConnState& state, const net::Message& msg) {
     std::string job_id      = net::parse_job_id     (msg);
     std::string error       = net::parse_error      (msg);
     int         retry_count = net::parse_retry_count(msg);
     int         max_retries = net::parse_max_retries(msg);
 
     dispatched_.erase(job_id);
+
+    // Phase 3: revoke lease + release from registry.
+    manager_.revoke_lease(job_id);
+    if (!state.worker_id.empty())
+        manager_.worker_registry().release_job(state.worker_id, job_id);
+
     auto r = manager_.fail_job(job_id, error, retry_count, max_retries);
     send_to(fd, net::make_ack(r.ok(), r.ok() ? "" : r.error()));
     try_dispatch();
 }
 
 // ─── handle_heartbeat ────────────────────────────────────────────────────────
+// Phase 3: update both the fd-keyed table AND the WorkerRegistry.
 
 void Server::handle_heartbeat(int fd, const net::Message& msg) {
     std::string wid = net::parse_worker_id(msg);
     Logger::debug(kComp, "Heartbeat from " + wid + " fd=" + std::to_string(fd));
+
+    // Phase 2 fd-keyed heartbeat.
     {
         std::lock_guard<std::mutex> lk{hb_mutex_};
         last_seen_ms_[fd] = now_ms();
     }
+
+    // Phase 3 worker_id-keyed heartbeat.
+    if (!wid.empty())
+        manager_.worker_registry().record_heartbeat(wid);
+
     send_to(fd, net::make_heartbeat_ack());
 }
 
 // ─── try_dispatch ─────────────────────────────────────────────────────────────
-// Walk the pending-pull deque and dispatch a job to each waiting worker until
-// either the queue is empty or all pending workers have been served.
 
 void Server::try_dispatch() {
     while (!pending_pulls_.empty()) {
         int worker_fd = pending_pulls_.front();
         pending_pulls_.pop_front();
 
-        // Check the worker is still connected.
         auto it = conns_.find(worker_fd);
         if (it == conns_.end() || it->second.conn->is_closed()) continue;
 
         auto job = manager_.try_pull_job();
-        if (!job) break;  // in-memory queue is empty
+        if (!job) break;
 
         dispatched_[job->job_id] = worker_fd;
+
+        // Phase 3: assign + lease.
+        ConnState& wstate = it->second;
+        if (!wstate.worker_id.empty())
+            manager_.worker_registry().assign_job(wstate.worker_id, job->job_id);
+        if (!wstate.worker_id.empty())
+            manager_.grant_lease(job->job_id, wstate.worker_id);
+
         Logger::info(kComp, "Dispatched (deferred) job " + job->job_id
-                             + " to worker " + it->second.worker_id);
+                             + " to worker " + wstate.worker_id
+                             + " [lease=30s]");
         send_to(worker_fd, net::make_job_dispatch(*job));
     }
 }
@@ -271,7 +311,6 @@ void Server::send_to(int fd, const net::Message& msg) {
     if (it == conns_.end()) return;
 
     it->second.conn->enqueue_send(msg);
-    // Try immediate flush; if not fully sent, watch for WRITE.
     bool done = it->second.conn->do_write();
     if (!done) {
         loop_.modify_fd(fd, net::Events::READ | net::Events::WRITE);
@@ -279,27 +318,37 @@ void Server::send_to(int fd, const net::Message& msg) {
 }
 
 // ─── close_conn ──────────────────────────────────────────────────────────────
+// Phase 3: deregister worker from WorkerRegistry; revoke leases for its jobs.
 
 void Server::close_conn(int fd) {
     auto it = conns_.find(fd);
     if (it == conns_.end()) return;
 
+    const std::string& wid = it->second.worker_id;
     Logger::info(kComp, "Closing connection fd=" + std::to_string(fd)
-                         + " worker=" + it->second.worker_id);
+                         + " worker=" + wid);
 
-    // Requeue any jobs that were dispatched to this worker.
+    // Requeue any jobs dispatched to this worker.
+    // For each, also revoke the lease (LeaseManager otherwise fires later too —
+    // both paths converge at requeue_job, which is idempotent).
     std::vector<std::string> to_requeue;
     for (auto& [job_id, worker_fd] : dispatched_) {
         if (worker_fd == fd) to_requeue.push_back(job_id);
     }
     for (const auto& job_id : to_requeue) {
         dispatched_.erase(job_id);
-        if (auto r = manager_.requeue_job(job_id); r.err()) {
+        manager_.revoke_lease(job_id);     // cancel in-memory timer
+        if (auto r = manager_.requeue_job(job_id); r.err())
             Logger::error(kComp, "requeue_job failed: " + r.error());
-        }
+    }
+    if (!to_requeue.empty()) {
+        try_dispatch();
     }
 
-    // Remove from pending-pull deque.
+    // Phase 3: deregister from WorkerRegistry.
+    if (!wid.empty())
+        manager_.worker_registry().deregister_worker(wid);
+
     pending_pulls_.erase(
         std::remove(pending_pulls_.begin(), pending_pulls_.end(), fd),
         pending_pulls_.end());
@@ -315,11 +364,11 @@ void Server::close_conn(int fd) {
 }
 
 // ─── reaper_loop ─────────────────────────────────────────────────────────────
+// Phase 3: uses WorkerRegistry.detect_failed() in addition to fd-keyed check.
 
 void Server::reaper_loop() {
     int64_t elapsed_ms = 0;
     while (loop_.running()) {
-        // Sleep in short increments so stop() wakes us up quickly.
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         elapsed_ms += 500;
         if (!loop_.running()) break;
@@ -327,6 +376,8 @@ void Server::reaper_loop() {
         elapsed_ms = 0;
 
         int64_t now = now_ms();
+
+        // Phase 2: fd-keyed heartbeat timeout → add to stale_fds_.
         std::lock_guard<std::mutex> lk{hb_mutex_};
         for (auto& [fd, ts] : last_seen_ms_) {
             if (now - ts > kHeartbeatTimeoutMs) {
@@ -340,7 +391,6 @@ void Server::reaper_loop() {
 }
 
 // ─── evict_stale ─────────────────────────────────────────────────────────────
-// Called on the EventLoop thread to safely close stale connections.
 
 void Server::evict_stale() {
     std::set<int> to_evict;

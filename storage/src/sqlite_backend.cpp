@@ -24,16 +24,17 @@ PRAGMA synchronous  = NORMAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id        TEXT    PRIMARY KEY,
-    job_type      TEXT    NOT NULL,
-    payload       TEXT    NOT NULL DEFAULT '',
-    priority      TEXT    NOT NULL DEFAULT 'NORMAL',
-    status        TEXT    NOT NULL DEFAULT 'PENDING',
-    created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL,
-    max_retries   INTEGER NOT NULL DEFAULT 3,
-    retry_count   INTEGER NOT NULL DEFAULT 0,
-    last_error    TEXT    NOT NULL DEFAULT ''
+    job_id               TEXT    PRIMARY KEY,
+    job_type             TEXT    NOT NULL,
+    payload              TEXT    NOT NULL DEFAULT '',
+    priority             TEXT    NOT NULL DEFAULT 'NORMAL',
+    status               TEXT    NOT NULL DEFAULT 'PENDING',
+    created_at_ms        INTEGER NOT NULL,
+    updated_at_ms        INTEGER NOT NULL,
+    max_retries          INTEGER NOT NULL DEFAULT 3,
+    retry_count          INTEGER NOT NULL DEFAULT 0,
+    last_error           TEXT    NOT NULL DEFAULT '',
+    lease_expires_at_ms  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status
@@ -41,6 +42,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status
 
 CREATE INDEX IF NOT EXISTS idx_jobs_priority_created
     ON jobs (priority DESC, created_at_ms ASC);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_lease
+    ON jobs (lease_expires_at_ms)
+    WHERE lease_expires_at_ms > 0;
+)SQL";
+
+// Schema migration for existing databases without the lease column.
+static constexpr const char* k_migrate_lease_col = R"SQL(
+ALTER TABLE jobs ADD COLUMN lease_expires_at_ms INTEGER NOT NULL DEFAULT 0;
 )SQL";
 
 // ─── Prepared-statement SQL ───────────────────────────────────────────────────
@@ -48,9 +58,10 @@ CREATE INDEX IF NOT EXISTS idx_jobs_priority_created
 static constexpr const char* k_sql_insert = R"SQL(
 INSERT INTO jobs
     (job_id, job_type, payload, priority, status,
-     created_at_ms, updated_at_ms, max_retries, retry_count, last_error)
+     created_at_ms, updated_at_ms, max_retries, retry_count, last_error,
+     lease_expires_at_ms)
 VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
 static constexpr const char* k_sql_update_status = R"SQL(
@@ -69,7 +80,8 @@ WHERE job_id = ?;
 
 static constexpr const char* k_sql_load_recoverable = R"SQL(
 SELECT job_id, job_type, payload, priority, status,
-       created_at_ms, updated_at_ms, max_retries, retry_count, last_error
+       created_at_ms, updated_at_ms, max_retries, retry_count, last_error,
+       lease_expires_at_ms
 FROM   jobs
 WHERE  status IN ('PENDING', 'RUNNING')
 ORDER  BY priority DESC, created_at_ms ASC;
@@ -77,13 +89,31 @@ ORDER  BY priority DESC, created_at_ms ASC;
 
 static constexpr const char* k_sql_get_by_id = R"SQL(
 SELECT job_id, job_type, payload, priority, status,
-       created_at_ms, updated_at_ms, max_retries, retry_count, last_error
+       created_at_ms, updated_at_ms, max_retries, retry_count, last_error,
+       lease_expires_at_ms
 FROM   jobs
 WHERE  job_id = ?;
 )SQL";
 
 static constexpr const char* k_sql_count = R"SQL(
 SELECT COUNT(*) FROM jobs;
+)SQL";
+
+static constexpr const char* k_sql_set_lease = R"SQL(
+UPDATE jobs SET lease_expires_at_ms = ?, updated_at_ms = ? WHERE job_id = ?;
+)SQL";
+
+static constexpr const char* k_sql_clear_lease = R"SQL(
+UPDATE jobs SET lease_expires_at_ms = 0, updated_at_ms = ? WHERE job_id = ?;
+)SQL";
+
+static constexpr const char* k_sql_expired_leases = R"SQL(
+SELECT job_id, job_type, payload, priority, status,
+       created_at_ms, updated_at_ms, max_retries, retry_count, last_error,
+       lease_expires_at_ms
+FROM   jobs
+WHERE  lease_expires_at_ms > 0 AND lease_expires_at_ms <= ?
+ORDER  BY lease_expires_at_ms ASC;
 )SQL";
 
 // ─── Helper: current epoch milliseconds ──────────────────────────────────────
@@ -136,11 +166,25 @@ SQLiteBackend::~SQLiteBackend() {
 
 VoidResult SQLiteBackend::init_schema() {
     char* err_msg = nullptr;
-    const int rc  = sqlite3_exec(db_, k_schema, nullptr, nullptr, &err_msg);
+    int rc = sqlite3_exec(db_, k_schema, nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         std::string msg = err_msg ? err_msg : "unknown";
         sqlite3_free(err_msg);
         return VoidResult::Err("init_schema: " + msg);
+    }
+
+    // Migration: add lease column to pre-Phase-3 databases.
+    // ALTER TABLE silently succeeds if we catch "duplicate column" error.
+    err_msg = nullptr;
+    rc = sqlite3_exec(db_, k_migrate_lease_col, nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK && err_msg) {
+        std::string msg = err_msg;
+        sqlite3_free(err_msg);
+        // "duplicate column name" means column already exists — safe to ignore.
+        if (msg.find("duplicate column") == std::string::npos)
+            return VoidResult::Err("migrate lease col: " + msg);
+    } else if (err_msg) {
+        sqlite3_free(err_msg);
     }
     return VoidResult::Ok();
 }
@@ -150,12 +194,15 @@ VoidResult SQLiteBackend::init_schema() {
 VoidResult SQLiteBackend::prepare_statements() {
     struct Pair { sqlite3_stmt** stmt; const char* sql; };
     const Pair pairs[] = {
-        { &stmt_insert_,           k_sql_insert           },
-        { &stmt_update_status_,    k_sql_update_status    },
-        { &stmt_increment_retry_,  k_sql_increment_retry  },
-        { &stmt_load_recoverable_, k_sql_load_recoverable },
-        { &stmt_get_by_id_,        k_sql_get_by_id        },
-        { &stmt_count_,            k_sql_count            },
+        { &stmt_insert_,             k_sql_insert           },
+        { &stmt_update_status_,      k_sql_update_status    },
+        { &stmt_increment_retry_,    k_sql_increment_retry  },
+        { &stmt_load_recoverable_,   k_sql_load_recoverable },
+        { &stmt_get_by_id_,          k_sql_get_by_id        },
+        { &stmt_count_,              k_sql_count            },
+        { &stmt_set_lease_,          k_sql_set_lease        },
+        { &stmt_clear_lease_,        k_sql_clear_lease      },
+        { &stmt_expired_leases_,     k_sql_expired_leases   },
     };
 
     for (const auto& [stmt_ptr, sql] : pairs) {
@@ -169,28 +216,32 @@ VoidResult SQLiteBackend::prepare_statements() {
 }
 
 void SQLiteBackend::finalize_statements() noexcept {
-    sqlite3_finalize(stmt_insert_);           stmt_insert_           = nullptr;
-    sqlite3_finalize(stmt_update_status_);    stmt_update_status_    = nullptr;
-    sqlite3_finalize(stmt_increment_retry_);  stmt_increment_retry_  = nullptr;
-    sqlite3_finalize(stmt_load_recoverable_); stmt_load_recoverable_ = nullptr;
-    sqlite3_finalize(stmt_get_by_id_);        stmt_get_by_id_        = nullptr;
-    sqlite3_finalize(stmt_count_);            stmt_count_            = nullptr;
+    sqlite3_finalize(stmt_insert_);             stmt_insert_             = nullptr;
+    sqlite3_finalize(stmt_update_status_);      stmt_update_status_      = nullptr;
+    sqlite3_finalize(stmt_increment_retry_);    stmt_increment_retry_    = nullptr;
+    sqlite3_finalize(stmt_load_recoverable_);   stmt_load_recoverable_   = nullptr;
+    sqlite3_finalize(stmt_get_by_id_);          stmt_get_by_id_          = nullptr;
+    sqlite3_finalize(stmt_count_);              stmt_count_              = nullptr;
+    sqlite3_finalize(stmt_set_lease_);          stmt_set_lease_          = nullptr;
+    sqlite3_finalize(stmt_clear_lease_);        stmt_clear_lease_        = nullptr;
+    sqlite3_finalize(stmt_expired_leases_);     stmt_expired_leases_     = nullptr;
 }
 
 // ─── Row extraction ───────────────────────────────────────────────────────────
 
 Job SQLiteBackend::row_to_job(sqlite3_stmt* stmt) {
     Job j;
-    j.job_id        = col_text(stmt, 0);
-    j.job_type      = col_text(stmt, 1);
-    j.payload       = col_text(stmt, 2);
-    j.priority      = priority_from_string(col_text(stmt, 3));
-    j.status        = status_from_string(col_text(stmt, 4));
-    j.created_at_ms = sqlite3_column_int64(stmt, 5);
-    j.updated_at_ms = sqlite3_column_int64(stmt, 6);
-    j.max_retries   = sqlite3_column_int(stmt, 7);
-    j.retry_count   = sqlite3_column_int(stmt, 8);
-    j.last_error    = col_text(stmt, 9);
+    j.job_id               = col_text(stmt, 0);
+    j.job_type             = col_text(stmt, 1);
+    j.payload              = col_text(stmt, 2);
+    j.priority             = priority_from_string(col_text(stmt, 3));
+    j.status               = status_from_string(col_text(stmt, 4));
+    j.created_at_ms        = sqlite3_column_int64(stmt, 5);
+    j.updated_at_ms        = sqlite3_column_int64(stmt, 6);
+    j.max_retries          = sqlite3_column_int(stmt, 7);
+    j.retry_count          = sqlite3_column_int(stmt, 8);
+    j.last_error           = col_text(stmt, 9);
+    j.lease_expires_at_ms  = sqlite3_column_int64(stmt, 10);
     return j;
 }
 
@@ -212,6 +263,7 @@ VoidResult SQLiteBackend::persist_job(const Job& job) {
     sqlite3_bind_int   (stmt_insert_, 8,  job.max_retries);
     sqlite3_bind_int   (stmt_insert_, 9,  job.retry_count);
     sqlite3_bind_text  (stmt_insert_, 10, job.last_error.c_str(),          -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64 (stmt_insert_, 11, job.lease_expires_at_ms);
 
     const int rc = sqlite3_step(stmt_insert_);
     if (rc != SQLITE_DONE) {
@@ -314,4 +366,52 @@ Result<int64_t> SQLiteBackend::total_job_count() {
         return Result<int64_t>::Ok(sqlite3_column_int64(stmt_count_, 0));
     }
     return Result<int64_t>::Err(std::string("total_job_count: ") + sqlite3_errmsg(db_));
+}
+
+// ─── set_lease ───────────────────────────────────────────────────────────────
+
+VoidResult SQLiteBackend::set_lease(const std::string& job_id,
+                                     int64_t expires_at_ms) {
+    std::lock_guard<std::mutex> lk{db_mutex_};
+    sqlite3_reset(stmt_set_lease_);
+    sqlite3_clear_bindings(stmt_set_lease_);
+    sqlite3_bind_int64(stmt_set_lease_, 1, expires_at_ms);
+    sqlite3_bind_int64(stmt_set_lease_, 2, now_ms());
+    sqlite3_bind_text (stmt_set_lease_, 3, job_id.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt_set_lease_);
+    if (rc != SQLITE_DONE)
+        return VoidResult::Err("set_lease: " + std::string(sqlite3_errmsg(db_)));
+    return VoidResult::Ok();
+}
+
+// ─── clear_lease ─────────────────────────────────────────────────────────────
+
+VoidResult SQLiteBackend::clear_lease(const std::string& job_id) {
+    std::lock_guard<std::mutex> lk{db_mutex_};
+    sqlite3_reset(stmt_clear_lease_);
+    sqlite3_clear_bindings(stmt_clear_lease_);
+    sqlite3_bind_int64(stmt_clear_lease_, 1, now_ms());
+    sqlite3_bind_text (stmt_clear_lease_, 2, job_id.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt_clear_lease_);
+    if (rc != SQLITE_DONE)
+        return VoidResult::Err("clear_lease: " + std::string(sqlite3_errmsg(db_)));
+    return VoidResult::Ok();
+}
+
+// ─── get_expired_leases ───────────────────────────────────────────────────────
+
+Result<std::vector<Job>> SQLiteBackend::get_expired_leases(int64_t now) {
+    std::lock_guard<std::mutex> lk{db_mutex_};
+    sqlite3_reset(stmt_expired_leases_);
+    sqlite3_clear_bindings(stmt_expired_leases_);
+    sqlite3_bind_int64(stmt_expired_leases_, 1, now);
+
+    std::vector<Job> jobs;
+    int rc;
+    while ((rc = sqlite3_step(stmt_expired_leases_)) == SQLITE_ROW)
+        jobs.push_back(row_to_job(stmt_expired_leases_));
+    if (rc != SQLITE_DONE)
+        return Result<std::vector<Job>>::Err(
+            "get_expired_leases: " + std::string(sqlite3_errmsg(db_)));
+    return Result<std::vector<Job>>::Ok(std::move(jobs));
 }

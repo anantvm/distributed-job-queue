@@ -6,6 +6,8 @@ add_executable(unit_tests
     test_storage.cpp
     test_worker.cpp
     test_protocol.cpp
+    test_worker_registry.cpp
+    test_lease_manager.cpp
 )
 
 target_link_libraries(unit_tests

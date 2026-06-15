@@ -25,11 +25,13 @@ static constexpr const char* kComp = "TcpWorker";
 
 // ─── Constructor / Destructor ─────────────────────────────────────────────────
 
-TcpWorker::TcpWorker(std::string host, uint16_t port, const HandlerRegistry& registry)
+TcpWorker::TcpWorker(std::string host, uint16_t port,
+                     const HandlerRegistry& registry,
+                     std::string worker_id)
     : host_(std::move(host))
     , port_(port)
     , registry_(registry)
-    , worker_id_(uuid::generate()) {
+    , worker_id_(worker_id.empty() ? uuid::generate() : std::move(worker_id)) {
     Logger::info(kComp, "Worker created id=" + worker_id_);
 }
 

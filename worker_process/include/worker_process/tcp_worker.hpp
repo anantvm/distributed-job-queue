@@ -29,7 +29,12 @@
 
 class TcpWorker {
 public:
-    TcpWorker(std::string host, uint16_t port, const HandlerRegistry& registry);
+    // host, port, registry: required.
+    // worker_id: optional — if empty, a UUID is generated. Pass a fixed ID to
+    //   test reconnect scenarios where the same logical worker reconnects after crash.
+    explicit TcpWorker(std::string host, uint16_t port,
+                       const HandlerRegistry& registry,
+                       std::string worker_id = "");
     ~TcpWorker();
 
     TcpWorker(const TcpWorker&)            = delete;
@@ -41,6 +46,9 @@ public:
 
     // Signal stop. Thread-safe (e.g., from a SIGINT handler).
     void stop();
+
+    // Forcefully close the socket to simulate a crash.
+    void disconnect();
 
     struct Stats {
         uint64_t jobs_executed{0};
@@ -76,8 +84,5 @@ private:
     // Returns false if connection closed.
     [[nodiscard]] bool recv_msg(net::Message& out);
 
-    // Execute job and return COMPLETE_JOB or FAIL_JOB.
     [[nodiscard]] net::Message execute_job(const Job& job);
-
-    void disconnect();
 };

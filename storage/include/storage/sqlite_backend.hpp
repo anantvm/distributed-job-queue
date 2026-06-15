@@ -51,6 +51,12 @@ public:
 
     [[nodiscard]] Result<int64_t> total_job_count() override;
 
+    // Phase 3 lease management
+    [[nodiscard]] VoidResult set_lease(const std::string& job_id,
+                                       int64_t expires_at_ms) override;
+    [[nodiscard]] VoidResult clear_lease(const std::string& job_id) override;
+    [[nodiscard]] Result<std::vector<Job>> get_expired_leases(int64_t now_ms) override;
+
 private:
     sqlite3*            db_{nullptr};
     std::string         db_path_;
@@ -63,6 +69,10 @@ private:
     sqlite3_stmt*  stmt_load_recoverable_{nullptr};
     sqlite3_stmt*  stmt_get_by_id_{nullptr};
     sqlite3_stmt*  stmt_count_{nullptr};
+    // Phase 3 lease statements
+    sqlite3_stmt*  stmt_set_lease_{nullptr};
+    sqlite3_stmt*  stmt_clear_lease_{nullptr};
+    sqlite3_stmt*  stmt_expired_leases_{nullptr};
 
     [[nodiscard]] VoidResult init_schema();
     [[nodiscard]] VoidResult prepare_statements();

@@ -53,4 +53,21 @@ public:
 
     // Total number of jobs in the store (all statuses).
     [[nodiscard]] virtual Result<int64_t> total_job_count() = 0;
+
+    // ── Phase 3: Lease management ─────────────────────────────────────────────
+
+    // Atomically set lease_expires_at_ms for a RUNNING job.
+    // Called immediately after dispatching a job to a worker.
+    [[nodiscard]] virtual VoidResult set_lease(
+        const std::string& job_id,
+        int64_t            expires_at_ms) = 0;
+
+    // Clear the lease (set to 0) for a job.
+    // Called when the job completes, fails, or is requeued.
+    [[nodiscard]] virtual VoidResult clear_lease(const std::string& job_id) = 0;
+
+    // Return all jobs whose lease has expired (lease_expires_at_ms > 0 &&
+    // lease_expires_at_ms <= now_ms). Used during crash recovery on startup.
+    [[nodiscard]] virtual Result<std::vector<Job>> get_expired_leases(
+        int64_t now_ms) = 0;
 };

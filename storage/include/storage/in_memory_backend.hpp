@@ -34,6 +34,12 @@ public:
 
     [[nodiscard]] Result<int64_t> total_job_count() override;
 
+    // Phase 3 lease management
+    [[nodiscard]] VoidResult set_lease(const std::string& job_id,
+                                       int64_t expires_at_ms) override;
+    [[nodiscard]] VoidResult clear_lease(const std::string& job_id) override;
+    [[nodiscard]] Result<std::vector<Job>> get_expired_leases(int64_t now_ms) override;
+
     // ── Test helpers ──────────────────────────────────────────────────────────
     void clear();
     [[nodiscard]] size_t size() const;

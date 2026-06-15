@@ -90,3 +90,38 @@ size_t InMemoryBackend::size() const {
     std::lock_guard lk{mutex_};
     return jobs_.size();
 }
+
+// ─── set_lease ───────────────────────────────────────────────────────────────
+
+VoidResult InMemoryBackend::set_lease(const std::string& job_id,
+                                       int64_t expires_at_ms) {
+    std::lock_guard lk{mutex_};
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end())
+        return VoidResult::Err("set_lease: job not found: " + job_id);
+    it->second.lease_expires_at_ms = expires_at_ms;
+    return VoidResult::Ok();
+}
+
+// ─── clear_lease ─────────────────────────────────────────────────────────────
+
+VoidResult InMemoryBackend::clear_lease(const std::string& job_id) {
+    std::lock_guard lk{mutex_};
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end())
+        return VoidResult::Err("clear_lease: job not found: " + job_id);
+    it->second.lease_expires_at_ms = 0;
+    return VoidResult::Ok();
+}
+
+// ─── get_expired_leases ───────────────────────────────────────────────────────
+
+Result<std::vector<Job>> InMemoryBackend::get_expired_leases(int64_t now) {
+    std::lock_guard lk{mutex_};
+    std::vector<Job> expired;
+    for (const auto& [id, job] : jobs_) {
+        if (job.lease_expires_at_ms > 0 && job.lease_expires_at_ms <= now)
+            expired.push_back(job);
+    }
+    return Result<std::vector<Job>>::Ok(std::move(expired));
+}

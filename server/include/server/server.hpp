@@ -94,8 +94,8 @@ private:
     void handle_submit_job     (int fd, const net::Message& msg);
     void handle_register_worker(int fd, ConnState& state, const net::Message& msg);
     void handle_pull_job       (int fd, ConnState& state);
-    void handle_complete_job   (int fd, const net::Message& msg);
-    void handle_fail_job       (int fd, const net::Message& msg);
+    void handle_complete_job   (int fd, ConnState& state, const net::Message& msg);
+    void handle_fail_job       (int fd, ConnState& state, const net::Message& msg);
     void handle_heartbeat      (int fd, const net::Message& msg);
 
     // Try to dispatch a job to a pending worker. Called after any job submission.

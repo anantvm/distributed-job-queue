@@ -84,6 +84,7 @@ struct Job {
     int         max_retries{3};
     int         retry_count{0};
     std::string last_error;        // populated on failure
+    int64_t     lease_expires_at_ms{0};  // Phase 3: 0 = no active lease
 
     // ── Ordering for std::priority_queue ─────────────────────────────────────
     // std::priority_queue<T> is a max-heap: top() returns the "greatest" Job.
