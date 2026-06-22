@@ -4,8 +4,20 @@
 #include <common/logger.hpp>
 #include <common/uuid.hpp>
 
+// Phase 4: metrics instrumentation
+#if __has_include(<metrics/metrics_registry.hpp>)
+#  include <metrics/metrics_registry.hpp>
+#  include <metrics/latency_tracker.hpp>
+#  define METRICS_ENABLED 1
+#else
+#  define METRICS_ENABLED 0
+#endif
+
 #include <chrono>
 #include <string>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdexcept>
 
 static constexpr const char* kComp = "JobManager";
 
@@ -20,11 +32,20 @@ int64_t JobManager::now_ms() {
 
 JobManager::JobManager(std::unique_ptr<IStorageBackend> storage)
     : storage_(std::move(storage)) {
+    if (::pipe(notify_pipe_) < 0) {
+        throw std::runtime_error("failed to create notify pipe");
+    }
+    for (int i = 0; i < 2; ++i) {
+        int flags = ::fcntl(notify_pipe_[i], F_GETFL, 0);
+        ::fcntl(notify_pipe_[i], F_SETFL, flags | O_NONBLOCK);
+    }
     Logger::info(kComp, "JobManager created");
 }
 
 JobManager::~JobManager() {
     shutdown();
+    if (notify_pipe_[0] >= 0) ::close(notify_pipe_[0]);
+    if (notify_pipe_[1] >= 0) ::close(notify_pipe_[1]);
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
@@ -96,11 +117,25 @@ Result<std::string> JobManager::submit_job(
     job.retry_count   = 0;
 
     // ── Persist FIRST (write-ahead) ───────────────────────────────────────────
+#if METRICS_ENABLED
+    MetricsRegistry::instance().gauge("job_queue_depth", "PENDING jobs in queue").increment();
+#endif
     if (auto r = storage_->persist_job(job); r.err()) {
+        // Undo gauge increment on failure.
+#if METRICS_ENABLED
+        MetricsRegistry::instance().gauge("job_queue_depth", "PENDING jobs in queue").decrement();
+#endif
         return Result<std::string>::Err("submit_job storage error: " + r.error());
     }
 
     const std::string id = job.job_id;
+
+    // Phase 4: record submission timestamp for latency tracking.
+#if METRICS_ENABLED
+    MetricsRegistry::instance().counter("jobs_submitted_total", "Total jobs submitted").increment();
+    LatencyTracker::instance().on_submitted(id, ts);
+#endif
+
     queue_.push(std::move(job));
 
     ++jobs_submitted_;
@@ -119,6 +154,11 @@ std::optional<Job> JobManager::try_pull_job() {
     if (job) {
         if (auto r = storage_->update_status(job->job_id, JobStatus::RUNNING); r.err())
             Logger::warn(kComp, "Failed to mark job RUNNING: " + r.error());
+        // Phase 4: record dispatch timestamp.
+#if METRICS_ENABLED
+        LatencyTracker::instance().on_dispatched(job->job_id, now_ms());
+        MetricsRegistry::instance().gauge("job_queue_depth", "PENDING jobs in queue").decrement();
+#endif
     }
     return job;
 }
@@ -138,6 +178,11 @@ VoidResult JobManager::complete_job(const std::string& job_id) {
     if (auto r = storage_->update_status(job_id, JobStatus::COMPLETED); r.err())
         return VoidResult::Err("complete_job: " + r.error());
     ++jobs_completed_;
+    // Phase 4: record completion for latency histograms + counter.
+#if METRICS_ENABLED
+    MetricsRegistry::instance().counter("jobs_completed_total", "Total jobs completed").increment();
+    LatencyTracker::instance().on_completed(job_id, now_ms());
+#endif
     Logger::info(kComp, "Completed job " + job_id);
     return VoidResult::Ok();
 }
@@ -167,6 +212,10 @@ VoidResult JobManager::fail_job(
 
         queue_.push(std::move(*job_result.value()));
         ++jobs_retried_;
+#if METRICS_ENABLED
+        MetricsRegistry::instance().counter("jobs_retried_total", "Total jobs retried").increment();
+        MetricsRegistry::instance().gauge("job_queue_depth", "PENDING jobs in queue").increment();
+#endif
 
     } else {
         Logger::error(kComp,
@@ -176,6 +225,10 @@ VoidResult JobManager::fail_job(
         if (auto r = storage_->update_status(job_id, JobStatus::FAILED, error); r.err())
             return VoidResult::Err("fail_job update_status: " + r.error());
         ++jobs_failed_;
+#if METRICS_ENABLED
+        MetricsRegistry::instance().counter("jobs_failed_total", "Total jobs permanently failed").increment();
+        LatencyTracker::instance().on_failed(job_id, now_ms());
+#endif
     }
 
     return VoidResult::Ok();
@@ -202,6 +255,10 @@ VoidResult JobManager::requeue_job(const std::string& job_id) {
         return VoidResult::Err("requeue_job: job not found: " + job_id);
 
     queue_.push(std::move(*job_result.value()));
+#if METRICS_ENABLED
+    MetricsRegistry::instance().counter("jobs_requeued_total", "Total jobs requeued on crash/expiry").increment();
+    MetricsRegistry::instance().gauge("job_queue_depth", "PENDING jobs in queue").increment();
+#endif
     return VoidResult::Ok();
 }
 
@@ -236,13 +293,23 @@ void JobManager::revoke_lease(const std::string& job_id) {
 
 void JobManager::on_lease_expired(const std::string& job_id,
                                    const std::string& worker_id) {
-    Logger::warn(kComp, "Lease expired for job " + job_id +
-                          " (worker=" + worker_id + ") — requeueing");
+    {
+        std::lock_guard lk{notify_mu_};
+        expired_leases_.push({job_id, worker_id});
+    }
+    // Wake up the EventLoop
+    char c = 'x';
+    static_cast<void>(::write(notify_pipe_[1], &c, 1));
+}
 
-    // Deregister job from registry so server doesn't try to requeue twice.
-    registry_.release_job(worker_id, job_id);
-
-    static_cast<void>(requeue_job(job_id));
+std::vector<std::pair<std::string, std::string>> JobManager::drain_expired_leases() {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::lock_guard lk{notify_mu_};
+    while (!expired_leases_.empty()) {
+        out.push_back(std::move(expired_leases_.front()));
+        expired_leases_.pop();
+    }
+    return out;
 }
 
 // ─── Metrics ─────────────────────────────────────────────────────────────────

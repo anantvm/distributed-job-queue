@@ -49,6 +49,13 @@ public:
 
     [[nodiscard]] uint16_t port() const noexcept { return port_; }
 
+    // Phase 4: Return a snapshot of the current JobManager metrics.
+    // Called by MetricsReporter from a background thread — safe because
+    // get_metrics() only reads atomic counters and takes short-lived locks.
+    [[nodiscard]] JobManager::Metrics get_metrics() const {
+        return manager_.get_metrics();
+    }
+
 private:
     uint16_t    port_;
     int         listen_fd_{-1};

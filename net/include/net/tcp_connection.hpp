@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <deque>
 
 namespace net {
 
@@ -66,7 +67,7 @@ private:
 
     std::vector<uint8_t> read_buf_;   // raw accumulation buffer
     std::vector<uint8_t> write_buf_;  // serialized bytes awaiting send
-    std::vector<Message> msg_queue_;  // fully parsed messages
+    std::deque<Message> msg_queue_;   // fully parsed messages
 
     // Maximum sizes (guards against memory exhaustion from malformed clients).
     static constexpr size_t kReadChunk  = 4096;

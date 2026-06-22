@@ -6,6 +6,14 @@
 #include <net/protocol.hpp>
 #include <net/socket_utils.hpp>
 
+// Phase 4: metrics instrumentation
+#if __has_include(<metrics/metrics_registry.hpp>)
+#  include <metrics/metrics_registry.hpp>
+#  define SRV_METRICS 1
+#else
+#  define SRV_METRICS 0
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -41,6 +49,30 @@ void Server::run() {
 
     loop_.add_fd(listen_fd_, net::Events::READ,
         [this](int fd, uint32_t) { (void)fd; on_new_connection(); });
+
+    // Phase 5: Subscribe to cross-thread lease expiry events from JobManager
+    int expiry_fd = manager_.expiry_event_fd();
+    if (expiry_fd >= 0) {
+        loop_.add_fd(expiry_fd, net::Events::READ,
+            [this](int, uint32_t) {
+                char buf[64];
+                while (::read(manager_.expiry_event_fd(), buf, sizeof(buf)) > 0) {}
+
+                auto expiries = manager_.drain_expired_leases();
+                for (const auto& [job_id, worker_id] : expiries) {
+                    bool found = (dispatched_.erase(job_id) > 0);
+                    manager_.worker_registry().release_job(worker_id, job_id);
+
+                    if (found) {
+                        Logger::warn(kComp, "Lease expired for job " + job_id + " — requeueing");
+                        if (auto r = manager_.requeue_job(job_id); r.err()) {
+                            Logger::error(kComp, "requeue_job failed: " + r.error());
+                        }
+                        try_dispatch();
+                    }
+                }
+            });
+    }
 
     // Phase 2 reaper: detects TCP-dead workers by heartbeat fd-timestamp.
     reaper_thread_ = std::thread([this] { reaper_loop(); });
@@ -91,6 +123,10 @@ void Server::on_new_connection() {
             std::lock_guard<std::mutex> lk{hb_mutex_};
             last_seen_ms_[fd] = now_ms();
         }
+#if SRV_METRICS
+        MetricsRegistry::instance().counter("connections_accepted_total", "TCP connections accepted").increment();
+        MetricsRegistry::instance().gauge("active_connections", "Currently open connections").increment();
+#endif
     }
 }
 
@@ -273,6 +309,9 @@ void Server::handle_heartbeat(int fd, const net::Message& msg) {
         manager_.worker_registry().record_heartbeat(wid);
 
     send_to(fd, net::make_heartbeat_ack());
+#if SRV_METRICS
+    MetricsRegistry::instance().counter("heartbeats_received_total", "Worker heartbeats received").increment();
+#endif
 }
 
 // ─── try_dispatch ─────────────────────────────────────────────────────────────
@@ -361,6 +400,10 @@ void Server::close_conn(int fd) {
         std::lock_guard<std::mutex> lk{hb_mutex_};
         last_seen_ms_.erase(fd);
     }
+#if SRV_METRICS
+    MetricsRegistry::instance().counter("connections_closed_total", "TCP connections closed").increment();
+    MetricsRegistry::instance().gauge("active_connections", "Currently open connections").decrement();
+#endif
 }
 
 // ─── reaper_loop ─────────────────────────────────────────────────────────────

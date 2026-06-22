@@ -31,6 +31,9 @@ void LeaseManager::stop() {
     running_ = false;
     cv_.notify_all();              // wake checker so it exits immediately
     if (checker_thread_.joinable()) checker_thread_.join();
+
+    std::unique_lock lk{mu_in_flight_};
+    cv_in_flight_.wait(lk, [this] { return in_flight_.load() == 0; });
 }
 
 // ─── grant ───────────────────────────────────────────────────────────────────
@@ -104,7 +107,12 @@ void LeaseManager::checker_loop() {
         // Fire callbacks outside the lock — safe for re-entrant revoke()/grant().
         if (on_expire_) {
             for (const auto& l : expired) {
-                on_expire_(l.job_id, l.worker_id);
+                in_flight_++;
+                try {
+                    on_expire_(l.job_id, l.worker_id);
+                } catch (...) {}
+                in_flight_--;
+                if (in_flight_.load() == 0) cv_in_flight_.notify_all();
             }
         }
     }

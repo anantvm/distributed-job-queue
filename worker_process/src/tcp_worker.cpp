@@ -5,6 +5,14 @@
 #include <common/uuid.hpp>
 #include <net/socket_utils.hpp>
 
+// Phase 4: worker metrics instrumentation
+#if __has_include(<metrics/metrics_registry.hpp>)
+#  include <metrics/metrics_registry.hpp>
+#  define WRK_METRICS 1
+#else
+#  define WRK_METRICS 0
+#endif
+
 #include <arpa/inet.h>
 #include <csignal>
 #include <poll.h>
@@ -139,6 +147,9 @@ net::Message TcpWorker::execute_job(const Job& job) {
         + " attempt=" + std::to_string(job.retry_count + 1));
 
     ++jobs_executed_;
+#if WRK_METRICS
+    MetricsRegistry::instance().counter("worker_jobs_executed_total", "Total jobs executed by worker").increment();
+#endif
 
     auto handler_opt = registry_.find(job.job_type);
     if (!handler_opt) {
@@ -148,9 +159,15 @@ net::Message TcpWorker::execute_job(const Job& job) {
                                   job.max_retries, job.max_retries);  // permanent fail
     }
 
+    auto start_time = std::chrono::steady_clock::now();
     try {
         (*handler_opt)(job);
         ++jobs_succeeded_;
+        auto end_time = std::chrono::steady_clock::now();
+#if WRK_METRICS
+        double duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+        MetricsRegistry::instance().histogram("worker_job_execution_ms", "Worker side job execution latency").observe(duration_ms);
+#endif
         Logger::info(kComp, "Completed job=" + job.job_id);
         return net::make_complete_job(job.job_id);
     } catch (const std::exception& ex) {

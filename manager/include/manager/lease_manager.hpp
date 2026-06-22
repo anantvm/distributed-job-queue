@@ -104,6 +104,10 @@ private:
     std::atomic<bool>  running_{false};
     std::condition_variable cv_;   // wakes checker early on stop()
 
+    std::atomic<int>        in_flight_{0};
+    std::mutex              mu_in_flight_;
+    std::condition_variable cv_in_flight_;
+
     void checker_loop();
     static int64_t now_ms();
 };

@@ -6,6 +6,7 @@ add_library(tcp_worker_lib STATIC
 
 target_include_directories(tcp_worker_lib
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_SOURCE_DIR}/metrics/include
 )
 
 target_link_libraries(tcp_worker_lib
@@ -20,4 +21,5 @@ add_executable(job_worker_process src/worker_main.cpp)
 target_link_libraries(job_worker_process
     PRIVATE tcp_worker_lib
     PRIVATE worker_lib
+    PRIVATE metrics_lib
 )

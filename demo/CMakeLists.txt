@@ -8,4 +8,5 @@ target_link_libraries(phase1_demo
     storage
     manager_lib
     worker_lib
+    metrics_lib
 )

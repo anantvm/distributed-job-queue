@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <unordered_map>
+#include <atomic>
 
 namespace net {
 
@@ -61,7 +62,7 @@ public:
 
 private:
     int  poll_fd_{-1};  // epoll fd (Linux) or kqueue fd (macOS)
-    bool running_{false};
+    std::atomic<bool> running_{false};
     std::unordered_map<int, EventCallback> callbacks_;
 
     void platform_add(int fd, uint32_t events);

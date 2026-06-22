@@ -19,7 +19,11 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <string>
+#include <utility>
+#include <vector>
+#include <mutex>
 
 class JobManager {
 public:
@@ -83,6 +87,14 @@ public:
 
     WorkerRegistry& worker_registry() { return registry_; }
 
+    // ── Phase 5: Lease Expiry EventLoop Integration ───────────────────────────
+
+    // Returns the read-end of a pipe that becomes readable when a lease expires.
+    [[nodiscard]] int expiry_event_fd() const { return notify_pipe_[0]; }
+
+    // Drains all expired leases from the thread-safe queue.
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>> drain_expired_leases();
+
     // ── Metrics ───────────────────────────────────────────────────────────────
 
     struct Metrics {
@@ -114,6 +126,11 @@ private:
     // Called by LeaseManager background thread when a lease expires.
     void on_lease_expired(const std::string& job_id,
                           const std::string& worker_id);
+
+    // Cross-thread notification for Server EventLoop
+    int notify_pipe_[2]{-1, -1};
+    std::mutex notify_mu_;
+    std::queue<std::pair<std::string, std::string>> expired_leases_;
 
     [[nodiscard]] static int64_t now_ms();
 };

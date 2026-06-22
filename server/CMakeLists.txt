@@ -6,6 +6,7 @@ add_library(server_lib STATIC
 
 target_include_directories(server_lib
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_SOURCE_DIR}/metrics/include
 )
 
 target_link_libraries(server_lib
@@ -22,4 +23,5 @@ target_link_libraries(job_manager_server
     PRIVATE server_lib
     PRIVATE storage        # for SQLiteBackend
     PRIVATE SQLite::SQLite3
+    PRIVATE metrics_lib
 )

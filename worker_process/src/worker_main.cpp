@@ -83,6 +83,11 @@ int main(int argc, char** argv) {
     registry.register_handler("flaky_job",       flaky_handler);
     registry.register_handler("always_fail_job", always_fail_handler);
 
+    // Fast handler for load testing
+    registry.register_handler("benchmark_job", [](const Job&) {
+        // no-op, just fast execution
+    });
+
     std::cout << "\033[1;34m"
               << "╔═══════════════════════════════════════╗\n"
               << "║   Distributed Job Queue — Phase 2     ║\n"

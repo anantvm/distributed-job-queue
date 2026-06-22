@@ -6,6 +6,7 @@ add_library(manager_lib STATIC
 )
 
 target_include_directories(manager_lib PUBLIC include)
+target_include_directories(manager_lib PRIVATE ${CMAKE_SOURCE_DIR}/metrics/include)
 
 target_compile_features(manager_lib PUBLIC cxx_std_20)
 

@@ -87,7 +87,7 @@ Message TcpConnection::pop_message() {
     if (msg_queue_.empty())
         throw std::logic_error("TcpConnection::pop_message() on empty queue");
     Message m = std::move(msg_queue_.front());
-    msg_queue_.erase(msg_queue_.begin());
+    msg_queue_.pop_front();
     return m;
 }
 
